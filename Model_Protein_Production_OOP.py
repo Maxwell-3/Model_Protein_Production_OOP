@@ -1,7 +1,9 @@
 #Import
+from cProfile import label
+from importlib.resources import path
 import os
 import numpy as np
-from numpy import random as rand
+from numpy import load, random as rand
 import random
 import scipy
 import matplotlib.pyplot as plt
@@ -14,9 +16,9 @@ import multiprocessing as mp
 #Parameters
 
 # Environment variable
-total_time = 7000 #simulation time second
+total_time = 7000.0 #simulation time second
 dt = 1/30 # s
-data_collection_interval = 1/2 # second
+data_collection_interval = 1/3 # second
 stage_per_collection = int(data_collection_interval/dt)
 data_smoothing_interval = 5 #s 
 max_processes_used = 6 #processes
@@ -65,6 +67,7 @@ max_worker_number = 4
 
 # Test
 testing = True # This control if testing will be conducted
+protein_production_off = True
 
 #||=====================================================================||
 #Helper Functions
@@ -77,10 +80,35 @@ def S(R):
 def n_dependence_cubic_3(x):
     return 1+0.778753*(x-1)+3.3249*(x-1)**2+0.379478*(x-3)**3
 
+def new_supercoiling(RNAP_list):
+    detached_rnap_amount = 0
+    
+    for rnap in RNAP_list:
+        if not rnap.attached:
+            detached_rnap_amount+=1
+    
+    if detached_rnap_amount == len(RNAP_list):
+        return np.zeros(len(RNAP_list))
+    
+    size = len(RNAP_list) - detached_rnap_amount
+
+    PHI = np.zeros(size, 2)
+
+    for i in range(size+1):
+        j = i + detached_rnap_amount
+        if i == 0:
+            PHI[i] = S(RNAP_list[j].position)
+            continue
+        elif i ==size:
+            PHI[i] = S(RNAP_list[j-1].position)
+            continue
+        else:
+            PHI[i] = S(RNAP_list[j-1].position-RNAP_list[j].position)
+
 def phi(RNAP_list, detached_rnap_amount):
     size = len(RNAP_list) - detached_rnap_amount
     if size == 0:
-        return None;
+        return None
     PHI = np.zeros(size+1)
     
     for i in range(size+1):
@@ -89,7 +117,7 @@ def phi(RNAP_list, detached_rnap_amount):
             PHI[i] = S(RNAP_list[j].position)
             continue
         elif i ==size:
-            PHI[i] = S(RNAP_list[j-1].position)
+            PHI[i] = 0#S(RNAP_list[j-1].position)  
             continue
         else:
             PHI[i] = S(RNAP_list[j-1].position-RNAP_list[j].position)
@@ -214,7 +242,7 @@ def load_list(duration, load_rate):
 
 def promoter_time_list(time_tot, on_time, off_time) :
     t_slots = promoter_time_list_non_cumulative(time_tot, on_time, off_time)
-    tot_t = 0;
+    tot_t = 0
     for slot in t_slots:
         slot[1] = tot_t + slot[1]
         tot_t = slot[1]
@@ -295,22 +323,49 @@ def uniform_promoter_time_list(time_tot, on_time, off_time):
             else:
                 t_slots.append([True, time_tot - t])
                 break
-    tot_t = 0;
+    tot_t = 0
     for slot in t_slots:
         slot[1] = tot_t + slot[1]
         tot_t = slot[1]
     return t_slots
+
+def uniform_loading_list(tot_time, loading_rate, repeating_loading, off_interval):
+    loading_time = 1/loading_rate
+    
+    load_list = []
+    t=0.0
+    prom_flag = True
+    have_loaded = 0
+    while t <= tot_time:
+        if prom_flag:
+            if t+loading_time >= tot_time:
+                break
+            if have_loaded < repeating_loading - 1:
+                load_list.append(t+loading_time)
+                t+=loading_time
+                have_loaded+=1
+            elif have_loaded == repeating_loading - 1:
+                load_list.append(loading_time+t)
+                t+=loading_time
+                have_loaded = 0 
+                prom_flag = False
+        else:
+            t+=off_interval
+            prom_flag = True
+    
+    return load_list
+
+
 
 #||---------------------------------------------------------------------||
 #Custom Random Generator
 #this is used for generator two phase step-wise random distribution
 
 def stepwise_exponential_generator(m1, m2, tcrit):
+    #factor = math.exp(-1*tcrit/m1)
     portion1 = 1-math.exp(-1*tcrit/m1)
-    portion2 = math.exp(-1*tcrit/m2)
-    norm_p1 = portion1/(portion1+portion2)
-    norm_p2 = portion2/(portion1+portion2)
-    choice = rand.choice([1,2], p = [norm_p1, norm_p2])
+    portion2 = 1-portion1
+    choice = rand.choice([1,2], p = [portion1, portion2])
     if choice == 1:
         passed = False
         while not passed:
@@ -325,6 +380,7 @@ def stepwise_exponential_generator(m1, m2, tcrit):
                 passed = True
     return result
 
+#Variable for this function: 120, 90, 102. 
 #fig, ax = plt.subplots(1, sharey=True, tight_layout=True)
 
 #stepwise_exponential_generator(20, 10, 5)
@@ -408,7 +464,7 @@ class Environment:
 
         #setup the profile
         self.t = 0
-        self.DNA = DNAstrand(interval_loading, pause_profile, degradation_time = 20, include_supercoiling = True, include_busty_promoter = True, mRNA_degradation = True)
+        self.DNA = DNAstrand(self.interval_loading, pause_profile=self.pause_profile, degradation_time = 20, include_supercoiling = self.include_supercoiling, include_busty_promoter = self.include_busty_promoter, mRNA_degradation = self.mRNA_degradation)
         self.total_prot = 0
 
         
@@ -417,6 +473,7 @@ class Environment:
         
     
     def start(self):
+        stage_per_collection = int(data_collection_interval/dt)
         self.initialize_data_structure()
         self.print_initialization()                                                                                     #print out initialization parameters
 
@@ -465,8 +522,9 @@ class Environment:
         # RNAP position
         self.RNAP_position = np.zeros((int(total_time/data_collection_interval), len(self.DNA.loading_list)))
             
-        #record the Ribosome Position on the RNA that is produced from the first Ribosome.
+        # Record the Ribosome Position on the RNgA that is produced from the first Ribosome.
         self.DNA_detached_time = np.zeros(len(self.DNA.loading_list))
+
 
     def print_initialization(self):
         initialization_bar_size = 80
@@ -484,14 +542,18 @@ class Environment:
         print ('|  ',"{:<30} {:<15} {:<26}".format('dt', "%.2f" % dt + 's',''), ' |')
         print ('|  ',"{:<30} {:<15} {:<26}".format('data_collection_interval', str(data_collection_interval)+'s',''), ' |')
         print ('|  ',"{:<30} {:<15} {:<26}".format('data_smoothing_interval', str(data_smoothing_interval)+'s',''), ' |')
+        print ('|  ',"{:<30} {:<15} {:<26}".format('total collections', str( int(total_time/data_collection_interval)),''), ' |')
+        print ('|  ',"{:<30} {:<15} {:<26}".format('stage per collection', str(  int(data_collection_interval/dt)),''), ' |')
         bar = '||' + '=' * (initialization_bar_size-4) + '||' 
         print(bar)
         print('Simulatation Starts. \n')
 
     def print_finish(self):
         print(f'Simulation Runtime: {self.total_runtime} s.')
-
         #Simulation Preliminary Report
+
+    #def dt_record(self, index):
+
 
     # Check and record data every step time as defined in the parameter. This step time is different from dt. 
     def step_record(self, index):
@@ -505,7 +567,11 @@ class Environment:
         #collect the rnap positions
         for i in range(len(self.DNA.RNAP_LIST)):
             self.RNAP_position[index][i] = self.DNA.RNAP_LIST[i].position
-    
+
+        #check for last ribo detachment, collect the time point for each RNAP.
+        for i in range(len(self.DNA.RNAP_LIST)):
+            pass
+
     # Used for obtaining the inner store data. No need for this now, as all data are exposed.
     def get_internal(self):
         pass
@@ -578,11 +644,11 @@ class Environment:
     # As the name say, this input the axes object from the Matplotlib and plot the velocity graph on that graph. return the axes
     # plotting the velocity of each RNAP on the axe object provided.
     # velocity graph of each RNAP is plotted separately 
-    def plot_velocity_RNAP(self, axe, plotting_range = [0, -1]):
+    def plot_velocity_RNAP(self, axe, start = 0, end = -1):
         
         
-        if plotting_range[1] == -1:
-            plotting_range[1] = self.RNAP_position.shape[1]
+        if end == -1:
+            end = self.RNAP_position.shape[1]
         
         veloctity_uc = self.get_velocity_not_cleaned()
         time = np.arange(0.0, total_time, data_collection_interval)
@@ -591,7 +657,7 @@ class Environment:
         
         
         #plot each line vec
-        for j in range(plotting_range[0], plotting_range[1]):
+        for j in range(start, end):
             start = 0
             end = 0
             
@@ -621,6 +687,52 @@ class Environment:
         ax.plot(range(int(total_time)), protein_ps)
         return ax
 
+    def plot_5_and_3_end_amount(self, axe):
+        #Using initiation time and degradation time point of RNAP to determine the 5' end.
+        #Using the degraded time point and detachment time point to determined the 3' end.
+        time_length = int(total_time/data_collection_interval)
+        rnap_list_size = len(self.DNA.RNAP_LIST)
+        five_three_interval = np.zeros((rnap_list_size, 4))
+        time_list = np.arange(0.0, total_time, data_collection_interval)
+        five_three_list = np.zeros((2, time_length))
+
+        for i in range(rnap_list_size):
+            # convert everything time point to index form, such that we can use it for the next step :)
+            initial_time = int(self.DNA.RNAP_LIST[i].initial_t/data_collection_interval)
+            t_degrade = initial_time + int(self.DNA.RNAP_LIST[i].t_degrade/data_collection_interval)
+            detach_time = int(self.DNA.RNAP_LIST[i].detach_time/data_collection_interval)
+            last_ribo_detach_time = int(self.DNA.RNAP_LIST[i].last_ribo_time_degraded)
+
+            five_three_interval[i] = [initial_time, t_degrade, detach_time, last_ribo_detach_time]
+        
+        # now we conduct some looping by adding 1 to everything 
+        for i in range(rnap_list_size):
+            #we first set some flags
+            initialized = False
+            degrading = False
+            detached = False
+            complete_degraded = False
+            for j in range(time_length):
+                # first do the five end. 
+                if initialized and not degrading:
+                    five_three_list[0][j] += 1
+                    if j >= five_three_interval[i][1]:
+                        degrading = True
+                else:
+                    if j >= five_three_interval[i][0]:
+                        initialized = True
+                # second do the three end
+                if detached and not complete_degraded:
+                    five_three_list[1][j] += 1
+                    if j >= five_three_interval[i][3]:
+                        complete_degraded = True
+                else:
+                    if j >= five_three_interval[i][2]:
+                        detached = True
+        axe.plot(time_list, five_three_list[0], label = '5 End Amount')
+        axe.plot(time_list, five_three_list[1], label = '3 End Amount')
+        return ax
+    
 #||---------------------------------------------------------------------||
 #DNAstrand Class
 
@@ -629,7 +741,7 @@ class Environment:
 class DNAstrand:
      
     def __init__(self, interval_loading, pause_profile = "flat", degradation_time = 0, include_supercoiling = True, include_busty_promoter = True, mRNA_degradation = True): 
-        self.length = length #? not really necessary, but antway
+        self.length = length 
         
         # Supercoiling 
         self.include_supercoiling = include_supercoiling
@@ -803,18 +915,25 @@ class RNAP:
             self.t_degrade = rand.exponential(scale = ribo_loading_interval)
         else: 
             self.t_degrade = total_time             
-        
+        self.degraded = False
+        self.last_ribo_time_degraded = total_time
+
         # Loading of Ribosomes
         self.loading_list = RIBO_loading_list(self.t_degrade, kRiboLoading)
+        if protein_production_off:
+            self.loading_list = []
         self.loading_stage = 0 # tracks which index of loading list to check next.
         self.loading_number = len(self.loading_list)  # how many loading events are there in the loading_list.
         self.RIBO_LIST = np.zeros(self.loading_number) # contains positions of all Ribosomes. 
         self.RIBO_loaded = 0 # shows how many ribosomes are loaded onto the mRNA
         self.RIBO_detached = 0 # shows how many ribomes has detached. 
-        
+        self.detach_time = total_time
+
     #RNAP.step() take in the base pair this instance transverse and change its inner data accordingly.
     def step(self, t, pace):
         
+        if self.degraded:
+            return 0
         prot = 0
         
         #check if detached
@@ -822,6 +941,7 @@ class RNAP:
             self.attached = False
             self.position = length + 1000
             pace = 0
+            self.detach_time = t
             #print("detached!")
         
         #recalculate(update) degradation
@@ -868,7 +988,7 @@ class RNAP:
         for i in range(active_RIBO):
             actual_i = i+old_RIBO_detached
             self.RIBO_LIST[actual_i] += stepping[i]
-            if self.RIBO_LIST[actual_i] >= length:
+            if self.RIBO_LIST[actual_i] > length:
                 self.RIBO_detached += 1
                 prot += 1
         
@@ -876,6 +996,11 @@ class RNAP:
         # now add pace
         self.position+= pace
         
+        # check for complete degradation.
+        if not self.attached and self.degrading and (self.RIBO_loaded == self.RIBO_detached):
+            self.degraded = True
+            self.last_ribo_time_degraded = t
+
         #return protein production
         return prot
     
@@ -886,19 +1011,111 @@ class RNAP:
 
 #||---------------------------------------------------------------------||
 
+
 #||=====================================================================||
 #Simulation
+#Determine File Name
 
-#env = Environment(30, pause_profile = "flat")
-#env.DNA.loading_list = RNAP_loading_list(uniform_promoter_time_list(total_time, 50, 500), 1/tau_loading)
-#env.start()
+#local_time = time.localtime()
 
+#print(local_time)
+#parent_dir = 'C:/Users/Zack/dev/Model_ProteinProduction_OOP/data/'
+#dir_name = f'{local_time.tm_mon}_{local_time.tm_mday}_{local_time.tm_hour}_{local_time.tm_min}'
+#path = parent_dir+ dir_name
+#os.mkdir(path)
+
+# Run Setting Adjustment
+
+total_time = 1000#s 
+data_collection_interval = dt*3
+
+env = Environment(tau_loading, include_busty_promoter=False)
+env.DNA.loading_list = uniform_loading_list(total_time, 1/tau_loading, 20, 20) #RNAP_loading_list(uniform_promoter_time_list(total_time, 20, 490), 1/tau_loading)
+env.start()
 
 
 
 #||=====================================================================||
+#Graphing
+
+time = np.arange(0.0, total_time, data_collection_interval)
+fig, ax = plt.subplots(figsize=(10, 5))
+fig.patch.set_facecolor('xkcd:white')
+ax.set_title('RNAP Amount')
+ax.plot(time, env.RNAP_amount)
+ax.grid(True)
+fig.savefig('rnap_amount.png')
+
+#||---------------------------------------------------------------------||
+
+fig, ax = plt.subplots(figsize = (10, 5))
+fig.patch.set_facecolor('xkcd:white')
+env.plot_trajectory_RNAP(ax)
+ax.set_xlabel('Time [s]')
+ax.set_ylabel('Position [bps]')
+ax.set_title('RNAP Position Plot')
+ax.axis([-5,total_time, -5, length])
+ax.grid(True)
+fig.savefig('position.png')
+
+fig, ax = plt.subplots(figsize = (10, 5))
+time = np.arange(0.0, total_time, data_collection_interval)
+ax.plot(time, env.protein_cumulative_amount)
+ax.set_xlabel('Time [s]')
+ax.set_ylabel('Protein Amount [bps]')
+ax.set_title('Cumulative Protein Production Plot')
+ax.axis([-5, total_time, -5, env.protein_cumulative_amount[-1]+10])
+ax.grid(True)
+fig.savefig('protein_amount.png')
+
+fig, ax = plt.subplots(figsize = (10, 5))
+time = np.arange(0.0, total_time, dt)
+ax.plot(time, env.protein_production)
+ax.set_xlabel('Time [s]')
+ax.set_ylabel('Protein Amount [bps]')
+ax.set_title('Protein Production Plot')
+ax.axis([0, total_time, -0.5, 4])
+ax.grid(True)
+fig.patch.set_facecolor('xkcd:white')
+fig.savefig('protein_production.png')
 
 
+fig, ax = plt.subplots(figsize = (10, 5))
+env.plot_velocity_RNAP(ax)
+ax.set_xlabel('Time [s]')
+ax.set_ylabel('Velocity [bps/s]')
+ax.set_title('RNAP Velocity Plot')
+ax.axis([-5, 100, -5, 100])
+ax.grid(True)
+fig.savefig('velocity.png')
+
+fig, ax = plt.subplots(figsize = (10, 5))
+env.plot_velocity_RNAP(ax, start = 0, end = 1)
+ax.set_xlabel('Time [s]')
+ax.set_ylabel('Velocity [bps/s]')
+ax.set_title('RNAP Velocity Plot')
+ax.axis([-5, 50, -5, 100])
+ax.grid(True)
+fig.savefig('first_velocity.png')
 
 
+fig, ax = plt.subplots(figsize = (10, 5))
+ax.plot(range(int(total_time/data_collection_interval)), env.step_processing_time)
+ax.set_xlabel('Stage')
+ax.set_ylabel('Time [s]')
+ax.set_title('Protein Production Plot')
+ax.grid(True)
+fig.patch.set_facecolor('xkcd:white')
+fig.savefig('processing_time.png')
+
+fig, ax = plt.subplots(figsize = (10, 5))
+env.plot_5_and_3_end_amount(ax)
+ax.set_xlabel('Time')
+ax.set_ylabel('Amount')
+ax.set_title('5 End and 3 End Amount Plot')
+ax.grid(True)
+ax.legend()
+fig.patch.set_facecolor('xkcd:white')
+fig.savefig('five_and_three.png')
+#||---------------------------------------------------------------------||
 #||=====================================================================||
